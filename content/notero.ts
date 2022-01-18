@@ -21,6 +21,13 @@ function patch(
   object[method][monkey_patch_marker] = true;
 }
 
+const SYNC_DEBOUNCE_MS = 2000;
+
+type QueuedSync = {
+  readonly itemIDs: Set<Zotero.Item['id']>;
+  timeoutID?: ReturnType<typeof setTimeout>;
+};
+
 class Notero {
   private static get tickIcon() {
     return `chrome://zotero/skin/tick${Zotero.hiDPI ? '@2x' : ''}.png`;
@@ -30,9 +37,13 @@ class Notero {
 
   private readonly progressWindow = new Zotero.ProgressWindow();
 
+  private queuedSync?: QueuedSync;
+
   private readonly stringBundle = Services.strings.createBundle(
     'chrome://notero/locale/notero.properties'
   );
+
+  private syncInProgress = false;
 
   // eslint-disable-next-line @typescript-eslint/require-await
   public async load(globals: Record<string, any>) {
@@ -127,7 +138,7 @@ class Notero {
       )
       .map(({ item }) => item);
 
-    void this.saveItemsToNotion(items);
+    this.enqueueItemsToSync(items);
   }
 
   private onModifyItems(ids: string[]) {
@@ -143,7 +154,7 @@ class Notero {
           .some((collectionID) => collectionIDs.has(collectionID))
     );
 
-    void this.saveItemsToNotion(items);
+    this.enqueueItemsToSync(items);
   }
 
   private getNotion() {
@@ -165,9 +176,50 @@ class Notero {
     return new Notion(authToken, databaseID);
   }
 
-  private async saveItemsToNotion(items: Zotero.Item[]) {
+  private enqueueItemsToSync(items: Zotero.Item[]) {
+    if (!items.length) return;
+
+    if (this.queuedSync?.timeoutID) {
+      clearTimeout(this.queuedSync.timeoutID);
+    }
+
+    const itemIDs = new Set([
+      ...(this.queuedSync?.itemIDs?.values() ?? []),
+      ...items.map(({ id }) => id),
+    ]);
+
+    const timeoutID = setTimeout(() => {
+      if (!this.queuedSync) return;
+
+      this.queuedSync.timeoutID = undefined;
+      if (!this.syncInProgress) {
+        void this.performSync();
+      }
+    }, SYNC_DEBOUNCE_MS);
+
+    this.queuedSync = { itemIDs, timeoutID };
+  }
+
+  private async performSync() {
+    if (!this.queuedSync) return;
+
+    const { itemIDs } = this.queuedSync;
+    this.queuedSync = undefined as QueuedSync | undefined;
+    this.syncInProgress = true;
+
+    await this.saveItemsToNotion(itemIDs);
+
+    if (this.queuedSync && !this.queuedSync.timeoutID) {
+      await this.performSync();
+    }
+
+    this.syncInProgress = false;
+  }
+
+  private async saveItemsToNotion(itemIDs: Set<Zotero.Item['id']>) {
     const PERCENTAGE_MULTIPLIER = 100;
 
+    const items = Zotero.Items.get(Array.from(itemIDs));
     if (!items.length) return;
 
     this.progressWindow.changeHeadline('Saving items to Notion...');
